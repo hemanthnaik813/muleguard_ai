@@ -1,9 +1,12 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import shutil
 import os
 import pandas as pd
 import numpy as np
 import networkx as nx
+import time
 
 from app.services.graph_builder import build_transaction_graph
 from app.services.cycle_detector import detect_cycles
@@ -12,11 +15,23 @@ from app.services.smurf_detector import detect_smurfing
 from app.services.shell_detector import detect_shell_chains
 from app.services.anomaly_detector import detect_anomalies_with_scores
 from app.services.scoring_engine import calculate_suspicion_scores
-
 from app.database import init_db, SessionLocal, SuspiciousHistory
 
 
-app = FastAPI()
+app = FastAPI(title="MuleGuard AI Backend")
+
+# ===============================
+# CORS (CRITICAL FOR RENDER)
+# ===============================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Change to frontend URL in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 init_db()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,185 +47,160 @@ REQUIRED_COLUMNS = [
 
 
 @app.get("/")
-def read_root():
-    return {"message": "MuleGuard AI Backend is running 🚀"}
+def health_check():
+    return {"status": "OK", "message": "MuleGuard AI Backend running 🚀"}
 
 
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...)):
+    start_time = time.time()
 
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    file_location = os.path.join(UPLOAD_FOLDER, file.filename)
-
-    # Save file
-    with open(file_location, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Read CSV
     try:
-        df = pd.read_csv(file_location)
-    except Exception as e:
-        return {"error": f"Failed to read CSV: {str(e)}"}
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
 
-    # Validate columns
-    missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing_columns:
-        return {"error": "Invalid CSV format", "missing_columns": missing_columns}
+        # Save file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    # Convert timestamp
-    try:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    except Exception:
-        return {"error": "Invalid timestamp format"}
+        # Read CSV
+        df = pd.read_csv(file_path)
 
-    # ------------------------------------------------
-    # BUILD GRAPH
-    # ------------------------------------------------
-    G = build_transaction_graph(df)
-
-    degree_centrality = nx.degree_centrality(G)
-    betweenness_centrality = nx.betweenness_centrality(G, normalized=True)
-    pagerank_scores = nx.pagerank(G)
-
-    # ------------------------------------------------
-    # PATTERN DETECTION
-    # ------------------------------------------------
-    cycles = detect_cycles(G)
-    fraud_rings, suspicious_accounts = assign_ring_ids(cycles)
-
-    smurf_rings, smurf_accounts = detect_smurfing(df)
-    fraud_rings.extend(smurf_rings)
-
-    for acc in smurf_accounts:
-        if not any(existing["account_id"] == acc["account_id"] for existing in suspicious_accounts):
-            suspicious_accounts.append(acc)
-
-    shell_rings, shell_accounts = detect_shell_chains(G)
-    fraud_rings.extend(shell_rings)
-
-    for acc in shell_accounts:
-        if not any(existing["account_id"] == acc["account_id"] for existing in suspicious_accounts):
-            suspicious_accounts.append(acc)
-
-    # ------------------------------------------------
-    # ML ANOMALY
-    # ------------------------------------------------
-    anomaly_scores = detect_anomalies_with_scores(G, df)
-
-    # ------------------------------------------------
-    # DATABASE SESSION START
-    # ------------------------------------------------
-    db = SessionLocal()
-
-    # ------------------------------------------------
-    # HYBRID SCORING (includes memory boost)
-    # ------------------------------------------------
-    suspicious_accounts = calculate_suspicion_scores(
-        suspicious_accounts,
-        df,
-        degree_centrality,
-        betweenness_centrality,
-        pagerank_scores,
-        anomaly_scores,
-        db
-    )
-
-    # ------------------------------------------------
-    # DYNAMIC THRESHOLD
-    # ------------------------------------------------
-    if suspicious_accounts:
-        scores = [acc["suspicion_score"] for acc in suspicious_accounts]
-        dynamic_threshold = max(40, np.percentile(scores, 70))
-    else:
-        dynamic_threshold = 40
-
-    suspicious_accounts = [
-        acc for acc in suspicious_accounts
-        if acc["suspicion_score"] >= dynamic_threshold
-    ]
-
-    # ------------------------------------------------
-    # CLEAN RINGS
-    # ------------------------------------------------
-    valid_account_ids = {acc["account_id"] for acc in suspicious_accounts}
-
-    fraud_rings = [
-        ring for ring in fraud_rings
-        if any(member in valid_account_ids for member in ring["member_accounts"])
-    ]
-
-    # ------------------------------------------------
-    # SAVE / UPDATE PERSISTENT MEMORY
-    # ------------------------------------------------
-    for acc in suspicious_accounts:
-
-        record = db.query(SuspiciousHistory).filter(
-            SuspiciousHistory.account_id == acc["account_id"]
-        ).first()
-
-        if record:
-            record.last_score = acc["suspicion_score"]
-            record.times_flagged += 1
-        else:
-            new_record = SuspiciousHistory(
-                account_id=acc["account_id"],
-                last_score=acc["suspicion_score"],
-                times_flagged=1
+        # Validate columns
+        missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+        if missing_columns:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Invalid CSV format", "missing_columns": missing_columns}
             )
-            db.add(new_record)
 
-    db.commit()
-    db.close()
+        # Convert timestamp
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-    # ------------------------------------------------
-    # SYSTEM METRICS
-    # ------------------------------------------------
-    high_risk = sum(1 for acc in suspicious_accounts if acc["risk_level"] == "HIGH")
-    medium_risk = sum(1 for acc in suspicious_accounts if acc["risk_level"] == "MEDIUM")
-    low_risk = sum(1 for acc in suspicious_accounts if acc["risk_level"] == "LOW")
+        # ===============================
+        # GRAPH BUILDING
+        # ===============================
+        G = build_transaction_graph(df)
 
-    fraud_density = round((len(suspicious_accounts) / G.number_of_nodes()) * 100, 2)
+        degree_centrality = nx.degree_centrality(G)
+        betweenness_centrality = nx.betweenness_centrality(G, normalized=True)
+        pagerank_scores = nx.pagerank(G)
 
-    system_metrics = {
-        "total_accounts": G.number_of_nodes(),
-        "total_transactions": G.number_of_edges(),
-        "high_risk_accounts": high_risk,
-        "medium_risk_accounts": medium_risk,
-        "low_risk_accounts": low_risk,
-        "fraud_density_percentage": fraud_density,
-        "dynamic_threshold_used": round(dynamic_threshold, 2)
-    }
+        # ===============================
+        # PATTERN DETECTION
+        # ===============================
+        cycles = detect_cycles(G)
+        fraud_rings, suspicious_accounts = assign_ring_ids(cycles)
 
-    # ------------------------------------------------
-    # RESPONSE
-    # ------------------------------------------------
-    return {
-        "filename": file.filename,
-        "rows": len(df),
-        "nodes": G.number_of_nodes(),
-        "edges": G.number_of_edges(),
-        "rings_detected": len(fraud_rings),
-        "suspicious_accounts_count": len(suspicious_accounts),
-        "fraud_rings": fraud_rings,
-        "suspicious_accounts": suspicious_accounts,
-        "system_metrics": system_metrics,
-        "message": "Hybrid Fraud Intelligence Engine completed 🚀🔥"
-    }
+        smurf_rings, smurf_accounts = detect_smurfing(df)
+        fraud_rings.extend(smurf_rings)
+        suspicious_accounts.extend(smurf_accounts)
+
+        shell_rings, shell_accounts = detect_shell_chains(G)
+        fraud_rings.extend(shell_rings)
+        suspicious_accounts.extend(shell_accounts)
+
+        # Remove duplicates
+        unique_accounts = {}
+        for acc in suspicious_accounts:
+            unique_accounts[acc["account_id"]] = acc
+        suspicious_accounts = list(unique_accounts.values())
+
+        # ===============================
+        # ANOMALY DETECTION
+        # ===============================
+        anomaly_scores = detect_anomalies_with_scores(G, df)
+
+        # ===============================
+        # DATABASE MEMORY
+        # ===============================
+        db = SessionLocal()
+
+        suspicious_accounts = calculate_suspicion_scores(
+            suspicious_accounts,
+            df,
+            degree_centrality,
+            betweenness_centrality,
+            pagerank_scores,
+            anomaly_scores,
+            db
+        )
+
+        # Dynamic Threshold
+        if suspicious_accounts:
+            scores = [acc["suspicion_score"] for acc in suspicious_accounts]
+            dynamic_threshold = max(40, np.percentile(scores, 70))
+        else:
+            dynamic_threshold = 40
+
+        suspicious_accounts = [
+            acc for acc in suspicious_accounts
+            if acc["suspicion_score"] >= dynamic_threshold
+        ]
+
+        # Clean Rings
+        valid_ids = {acc["account_id"] for acc in suspicious_accounts}
+        fraud_rings = [
+            ring for ring in fraud_rings
+            if any(member in valid_ids for member in ring["member_accounts"])
+        ]
+
+        # Save history
+        for acc in suspicious_accounts:
+            record = db.query(SuspiciousHistory).filter(
+                SuspiciousHistory.account_id == acc["account_id"]
+            ).first()
+
+            if record:
+                record.last_score = acc["suspicion_score"]
+                record.times_flagged += 1
+            else:
+                db.add(SuspiciousHistory(
+                    account_id=acc["account_id"],
+                    last_score=acc["suspicion_score"],
+                    times_flagged=1
+                ))
+
+        db.commit()
+        db.close()
+
+        processing_time = round(time.time() - start_time, 2)
+
+        # ===============================
+        # RESPONSE (FRONTEND COMPATIBLE)
+        # ===============================
+        return JSONResponse({
+            "fraud_rings": fraud_rings,
+            "suspicious_accounts": suspicious_accounts,
+            "summary": {
+                "total_accounts_analyzed": G.number_of_nodes(),
+                "total_transactions": G.number_of_edges(),
+                "suspicious_accounts_flagged": len(suspicious_accounts),
+                "fraud_rings_detected": len(fraud_rings),
+                "processing_time_seconds": processing_time
+            },
+            "raw_transactions": df.to_dict(orient="records"),
+            "message": "Hybrid Fraud Intelligence Engine completed 🚀🔥"
+        })
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/history/")
-def get_suspicion_history():
+def get_history():
     db = SessionLocal()
-
     records = db.query(SuspiciousHistory).all()
 
-    history = []
-    for r in records:
-        history.append({
+    history = [
+        {
             "account_id": r.account_id,
             "last_score": r.last_score,
             "times_flagged": r.times_flagged,
             "last_flagged_at": r.last_flagged_at
-        })
+        }
+        for r in records
+    ]
 
     db.close()
 
